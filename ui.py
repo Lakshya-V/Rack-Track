@@ -10,17 +10,21 @@ from PyQt5.QtWidgets import (
     QDialogButtonBox,
     QMessageBox,
     QInputDialog,
-    QTabWidget
+    QTabWidget,
+    QTableWidget,
+    QTableWidgetItem,
+    QHeaderView,
+    QComboBox
 )
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import (
     QIcon,
     QFont,
 )
-import sqlite3       # add if book is available or not and check and rectify tab problems
+import sqlite3       
 
 connection = sqlite3.connect("rack-track.db")
-connection.row_factory = sqlite3.Row
+connection.row_factory = sqlite3.Row # to access columns by name
 
 class MainWindow(QMainWindow):
     """Initial window with Admin and Client buttons."""
@@ -188,11 +192,10 @@ class AdminWindow(QMainWindow):
         tab1_layout.addWidget(tab1_layout.search_button)
         tab1_layout.search_button.clicked.connect(self.search_book)
 
-        # Results area
+        # Results area (show labelled results including status)
         tab1_layout.result_label = QLabel("", self)
         tab1_layout.result_label.setWordWrap(True)
         tab1_layout.addWidget(tab1_layout.result_label)
-
 
         # Note: QMainWindow uses setCentralWidget; don't call setLayout on it
         self.tab.addTab(tab1_content, "Search Book")
@@ -202,8 +205,8 @@ class AdminWindow(QMainWindow):
         tab2_layout = QVBoxLayout()
         tab2_content.setLayout(tab2_layout)
 
-        # Book management: list + buttons
-        tab2_layout.addWidget(QLabel("Manage Books"))
+        # Book management: filter + table + buttons
+        tab2_layout.addWidget(QLabel("Books Management"))
         tab2_layout.book_search = QLineEdit(self)
         tab2_layout.book_search.setPlaceholderText("Filter books by title/author")
         tab2_layout.addWidget(tab2_layout.book_search)
@@ -217,19 +220,189 @@ class AdminWindow(QMainWindow):
         buttons_row.addWidget(tab2_layout.edit_btn)
         buttons_row.addWidget(tab2_layout.remove_btn)
 
-        tab2_layout.results_box = QLabel("(No selection)")
-        tab2_layout.results_box.setWordWrap(True)
-        tab2_layout.addWidget(tab2_layout.results_box)
+        # replace the old results label with a QTableWidget for clear columns
+        self.book_table = QTableWidget()
+        self.book_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.book_table.setSelectionMode(QTableWidget.SingleSelection)
+        self.book_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        tab2_layout.addWidget(self.book_table)
+        # connect selection change handler once
+        self.book_table.itemSelectionChanged.connect(self._on_book_selection_changed)
 
         # wire buttons
         tab2_layout.add_btn.clicked.connect(self.add_book_dialog)
         tab2_layout.edit_btn.clicked.connect(self.edit_book_dialog)
         tab2_layout.remove_btn.clicked.connect(self.remove_book)
+        tab2_layout.book_search.textChanged.connect(lambda t: self.load_books(t))
 
         self.tab.addTab(tab2_content, "Manage Books")
+
+        tab3_content = QWidget()
+        tab3_layout = QVBoxLayout()
+        tab3_content.setLayout(tab3_layout)
+
+        tab3_layout.addWidget(QLabel("Clients Management"))
+        tab3_layout.client_search = QLineEdit(self)
+        tab3_layout.client_search.setPlaceholderText("Filter clients by username/email")
+        tab3_layout.addWidget(tab3_layout.client_search)
+
+        crow = QHBoxLayout()
+        tab3_layout.addLayout(crow)
+        tab3_layout.add_btn = QPushButton("Add Client")
+        tab3_layout.edit_btn = QPushButton("Edit Selected")
+        tab3_layout.remove_btn = QPushButton("Remove Selected")
+        crow.addWidget(tab3_layout.add_btn)
+        crow.addWidget(tab3_layout.edit_btn)
+        crow.addWidget(tab3_layout.remove_btn)
+
+        # client table
+        self.client_table = QTableWidget()
+        self.client_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.client_table.setSelectionMode(QTableWidget.SingleSelection)
+        self.client_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        tab3_layout.addWidget(self.client_table)
+
+        # wire client buttons
+        tab3_layout.add_btn.clicked.connect(self.add_client_dialog)
+        tab3_layout.edit_btn.clicked.connect(self.edit_client_dialog)
+        tab3_layout.remove_btn.clicked.connect(self.remove_client)
+        tab3_layout.client_search.textChanged.connect(lambda t: self.load_clients(t))
+
+        # connect selection handler
+        self.client_table.itemSelectionChanged.connect(self._on_client_selection_changed)
+
+        # add the tab
+        self.tab.addTab(tab3_content, "Manage Clients")
+
         layout.addWidget(QLabel(f"Welcome Admin: {username}"))
         central.setLayout(layout)
         self.setCentralWidget(central)
+
+        # detect book columns and populate table
+        self._book_columns = self._detect_book_columns()
+        # set up table headers
+        self.book_table.setColumnCount(len(self._book_columns))
+        self.book_table.setHorizontalHeaderLabels([c.upper() for c in self._book_columns])
+        # load initial book list
+        self.load_books()
+        # setup clients table and load
+        self._client_columns = self._detect_client_columns()
+        if hasattr(self, 'client_table') and self._client_columns:
+            self.client_table.setColumnCount(len(self._client_columns))
+            self.client_table.setHorizontalHeaderLabels([c.upper() for c in self._client_columns])
+            self.load_clients()
+
+    def _detect_book_columns(self):
+        """Return list of book columns in preferred order depending on DB."""
+        cur = connection.cursor()
+        try:
+            cur.execute("PRAGMA table_info(book)")
+            cols = [row[1] for row in cur.fetchall()]
+        finally:
+            cur.close()
+        preferred = ['id', 'title', 'author', 'status', 'rack_column_row', 'year', 'isbn']
+        # return intersection in preferred order, then any other columns
+        ordered = [c for c in preferred if c in cols]
+        for c in cols:
+            if c not in ordered:
+                ordered.append(c)
+        return ordered
+
+    def load_books(self, filter_text=''):
+        """Populate the book_table with rows matching optional filter_text."""
+        cols = self._book_columns
+        if not cols:
+            return
+        sel_sql = ",".join(cols)
+        sql = f"SELECT {sel_sql} FROM book"
+        params = ()
+        if filter_text:
+            sql += " WHERE title LIKE ? OR author LIKE ? OR isbn LIKE ?"
+            params = (f"%{filter_text}%", f"%{filter_text}%", f"%{filter_text}%")
+
+        cur = connection.cursor()
+        try:
+            cur.execute(sql, params)
+            rows = cur.fetchall()
+        finally:
+            cur.close()
+
+        self.book_table.setRowCount(len(rows))
+        for r_i, r in enumerate(rows):
+            for c_i, col in enumerate(cols):
+                val = r[col] if col in r.keys() else ''
+                item = QTableWidgetItem(str(val) if val is not None else '')
+                self.book_table.setItem(r_i, c_i, item)
+
+        # disable edit/remove when nothing is selected; UI selection handler toggles these
+        self.tab.widget(1).layout().edit_btn.setEnabled(False)
+        self.tab.widget(1).layout().remove_btn.setEnabled(False)
+
+    def _on_book_selection_changed(self):
+        has = bool(self.book_table.selectedItems())
+        try:
+            layout = self.tab.widget(1).layout()
+            layout.edit_btn.setEnabled(has)
+            layout.remove_btn.setEnabled(has)
+        except Exception:
+            pass
+
+    # --- Client helpers ---
+    def _detect_client_columns(self):
+        cur = connection.cursor()
+        try:
+            cur.execute("PRAGMA table_info(client)")
+            cols = [row[1] for row in cur.fetchall()]
+        finally:
+            cur.close()
+        preferred = ['client_id', 'username', 'email', 'password']
+        ordered = [c for c in preferred if c in cols]
+        for c in cols:
+            if c not in ordered:
+                ordered.append(c)
+        return ordered
+
+    def load_clients(self, filter_text=''):
+        cols = self._detect_client_columns()
+        if not cols:
+            return
+        sel_sql = ",".join(cols)
+        sql = f"SELECT {sel_sql} FROM client"
+        params = ()
+        if filter_text:
+            sql += " WHERE username LIKE ? OR email LIKE ?"
+            params = (f"%{filter_text}%", f"%{filter_text}%")
+        cur = connection.cursor()
+        try:
+            cur.execute(sql, params)
+            rows = cur.fetchall()
+        finally:
+            cur.close()
+
+        self.client_table.setColumnCount(len(cols))
+        self.client_table.setHorizontalHeaderLabels([c.upper() for c in cols])
+        self.client_table.setRowCount(len(rows))
+        for r_i, r in enumerate(rows):
+            for c_i, col in enumerate(cols):
+                val = r[col] if col in r.keys() else ''
+                self.client_table.setItem(r_i, c_i, QTableWidgetItem(str(val) if val is not None else ''))
+
+        # disable edit/remove initially
+        try:
+            layout = self.tab.widget(2).layout()
+            layout.edit_btn.setEnabled(False)
+            layout.remove_btn.setEnabled(False)
+        except Exception:
+            pass
+
+    def _on_client_selection_changed(self):
+        has = bool(self.client_table.selectedItems())
+        try:
+            layout = self.tab.widget(2).layout()
+            layout.edit_btn.setEnabled(has)
+            layout.remove_btn.setEnabled(has)
+        except Exception:
+            pass
 
     def search_book(self):
         text = self.tab.widget(0).layout().search_input.text().strip()
@@ -263,64 +436,180 @@ class AdminWindow(QMainWindow):
             r_id = r['id'] if 'id' in keys else ''
             title = r['title'] if 'title' in keys else ''
             author = r['author'] if 'author' in keys else ''
+            status = r['status'] if 'status' in keys else ''
             rcr = r['rack_column_row'] if 'rack_column_row' in keys else ''
             year_val = r['year'] if 'year' in keys else ''
             isbn = r['isbn'] if 'isbn' in keys else ''
-            out.append(f"{r_id}: {title} — {author} {rcr} ({year_val}) ISBN:{isbn}")
-        self.tab.widget(0).layout().result_label.setText("\n".join(out))
+            out.append(f"{r_id or isbn}: {title}\n  Author: {author} | Status: {status} | Rack: {rcr} | Year: {year_val} | ISBN: {isbn}")
+        self.tab.widget(0).layout().result_label.setText("\n\n".join(out))
 
     def add_book_dialog(self):
         dlg = BookEditDialog(parent=self)
         if dlg.exec() == QDialog.Accepted:
-            title, author, rcr, year, isbn = dlg.get_data()
+            title, author, status, rcr, year, isbn = dlg.get_data()
             local_cur = connection.cursor()
             try:
-                local_cur.execute("INSERT INTO book(title,author,rack_column_row,year,isbn) VALUES(?,?,?,?,?)", (title, author, rcr, year or None, isbn))
+                local_cur.execute(
+                    "INSERT INTO book(title,author,status,rack_column_row,year,isbn) VALUES(?,?,?,?,?,?)",
+                    (title, author, status, rcr, year or None, isbn),
+                )
                 connection.commit()
             finally:
                 local_cur.close()
             QMessageBox.information(self, "Added", "Book added successfully.")
+            # refresh table
+            self.load_books(self.tab.widget(1).layout().book_search.text().strip())
 
     def edit_book_dialog(self):
-        # For simplicity, ask for the book id to edit
-        id_text, ok = QInputDialog.getText(self, "Edit Book", "Enter book id to edit:")
-        if not ok or not id_text.strip().isdigit():
-            return
-        book_id = int(id_text.strip())
+        # If a row is selected in the table, edit that; otherwise prompt for pk (id or isbn)
+        pk_col = self._book_columns[0] if self._book_columns else 'isbn'
+        selected = self.book_table.selectedItems()
+        pk_value = None
+        if selected:
+            # first column value of the selected row
+            row_idx = selected[0].row()
+            pk_value = self.book_table.item(row_idx, 0).text()
+        else:
+            prompt = f"Enter book {pk_col} to edit:"
+            id_text, ok = QInputDialog.getText(self, "Edit Book", prompt)
+            if not ok or not id_text.strip():
+                return
+            pk_value = id_text.strip()
+
+        # fetch the book by pk
         local_cur = connection.cursor()
         try:
-            local_cur.execute("SELECT * FROM book WHERE id = ?", (book_id,))
+            local_cur.execute(f"SELECT * FROM book WHERE {pk_col} = ?", (pk_value,))
             row = local_cur.fetchone()
         finally:
             local_cur.close()
         if not row:
-            QMessageBox.warning(self, "Not found", "No book with that id")
+            QMessageBox.warning(self, "Not found", "No book with that identifier")
             return
-        dlg = BookEditDialog(parent=self, data=(row['title'], row['author'], row['year'], row['isbn']))
+
+        # prepare data tuple in order (title,author,status,rack_column_row,year,isbn)
+        data = (
+            row['title'] if 'title' in row.keys() else '',
+            row['author'] if 'author' in row.keys() else '',
+            row['status'] if 'status' in row.keys() else '',
+            row['rack_column_row'] if 'rack_column_row' in row.keys() else '',
+            row['year'] if 'year' in row.keys() else None,
+            row['isbn'] if 'isbn' in row.keys() else '',
+        )
+        dlg = BookEditDialog(parent=self, data=data)
         if dlg.exec() == QDialog.Accepted:
-            title, author, rcr, year, isbn = dlg.get_data()
+            title, author, status, rcr, year, isbn = dlg.get_data()
             local_cur = connection.cursor()
             try:
-                local_cur.execute("UPDATE book SET title=?,author=?,rack_column_row=?,year=?,isbn=? WHERE id=?",(title, author, rcr, year or None, isbn, book_id))
+                local_cur.execute(
+                    f"UPDATE book SET title=?,author=?,status=?,rack_column_row=?,year=?,isbn=? WHERE {pk_col}=?",
+                    (title, author, status, rcr, year or None, isbn, pk_value),
+                )
                 connection.commit()
             finally:
                 local_cur.close()
             QMessageBox.information(self, "Updated", "Book updated.")
+            self.load_books(self.tab.widget(1).layout().book_search.text().strip())
 
     def remove_book(self):
-        id_text, ok = QInputDialog.getText(self, "Remove Book", "Enter book id to remove:")
-        if not ok or not id_text.strip().isdigit():
-            return
-        book_id = int(id_text.strip())
-        if QMessageBox.question(self, "Confirm", f"Delete book {book_id}?") != QMessageBox.Yes:
+        # remove selected row if present, else prompt for pk
+        pk_col = self._book_columns[0] if self._book_columns else 'isbn'
+        selected = self.book_table.selectedItems()
+        if selected:
+            row_idx = selected[0].row()
+            pk_value = self.book_table.item(row_idx, 0).text()
+        else:
+            id_text, ok = QInputDialog.getText(self, "Remove Book", f"Enter book {pk_col} to remove:")
+            if not ok or not id_text.strip():
+                return
+            pk_value = id_text.strip()
+
+        if QMessageBox.question(self, "Confirm", f"Delete book {pk_value}?") != QMessageBox.Yes:
             return
         local_cur = connection.cursor()
         try:
-            local_cur.execute("DELETE FROM book WHERE id = ?", (book_id,))
+            local_cur.execute(f"DELETE FROM book WHERE {pk_col} = ?", (pk_value,))
             connection.commit()
         finally:
             local_cur.close()
         QMessageBox.information(self, "Removed", "Book removed.")
+        self.load_books(self.tab.widget(1).layout().book_search.text().strip())
+
+    def add_client_dialog(self) :
+        dlg = ClientEditDialog(parent=self)
+        if dlg.exec() == QDialog.Accepted:
+            username, password, email = dlg.get_data()
+            cur = connection.cursor()
+            try:
+                cur.execute("INSERT INTO client(username,password,email) VALUES(?,?,?)", (username, password, email))
+                connection.commit()
+            finally:
+                cur.close()
+            QMessageBox.information(self, "Added", "Client added.")
+            self.load_clients(self.tab.widget(2).layout().client_search.text().strip())
+
+    def edit_client_dialog(self) :
+        # edit selected client or prompt for identifier
+        cols = self._detect_client_columns()
+        pk_col = cols[0] if cols else 'client_id'
+        selected = self.client_table.selectedItems()
+        if selected:
+            row_idx = selected[0].row()
+            pk_value = self.client_table.item(row_idx, 0).text()
+        else:
+            id_text, ok = QInputDialog.getText(self, "Edit Client", f"Enter client {pk_col} to edit:")
+            if not ok or not id_text.strip():
+                return
+            pk_value = id_text.strip()
+
+        cur = connection.cursor()
+        try:
+            cur.execute(f"SELECT * FROM client WHERE {pk_col} = ?", (pk_value,))
+            row = cur.fetchone()
+        finally:
+            cur.close()
+        if not row:
+            QMessageBox.warning(self, "Not found", "No client with that identifier")
+            return
+        data = (
+            row['username'] if 'username' in row.keys() else '',
+            row['password'] if 'password' in row.keys() else '',
+            row['email'] if 'email' in row.keys() else '',
+        )
+        dlg = ClientEditDialog(parent=self, data=data)
+        if dlg.exec() == QDialog.Accepted:
+            username, password, email = dlg.get_data()
+            cur = connection.cursor()
+            try:
+                cur.execute(f"UPDATE client SET username=?,password=?,email=? WHERE {pk_col}=?", (username, password, email, pk_value))
+                connection.commit()
+            finally:
+                cur.close()
+            QMessageBox.information(self, "Updated", "Client updated.")
+            self.load_clients(self.tab.widget(2).layout().client_search.text().strip())
+
+    def remove_client(self) :
+        cols = self._detect_client_columns()
+        pk_col = cols[0] if cols else 'client_id'
+        selected = self.client_table.selectedItems()
+        if selected:
+            row_idx = selected[0].row()
+            pk_value = self.client_table.item(row_idx, 0).text()
+        else:
+            id_text, ok = QInputDialog.getText(self, "Remove Client", f"Enter client {pk_col} to remove:")
+            if not ok or not id_text.strip():
+                return
+            pk_value = id_text.strip()
+        if QMessageBox.question(self, "Confirm", f"Delete client {pk_value}?") != QMessageBox.Yes:
+            return
+        cur = connection.cursor()
+        try:
+            cur.execute(f"DELETE FROM client WHERE {pk_col} = ?", (pk_value,))
+            connection.commit()
+        finally:
+            cur.close()
+        QMessageBox.information(self, "Removed", "Client removed.")
+        self.load_clients(self.tab.widget(2).layout().client_search.text().strip())
 
 
 class ClientWindow(QMainWindow):
@@ -364,6 +653,12 @@ class BookEditDialog(QDialog):
         self.author_edit = QLineEdit()
         layout.addWidget(self.author_edit)
 
+        layout.addWidget(QLabel("Status:"))
+        self.status_box = QComboBox()
+        # common statuses
+        self.status_box.addItems(["available", "checked out", "reserved", "lost"]) 
+        layout.addWidget(self.status_box)
+
         layout.addWidget(QLabel("Rack/Column/Row:"))
         self.rack_column_row_edit = QLineEdit()
         layout.addWidget(self.rack_column_row_edit)
@@ -382,13 +677,22 @@ class BookEditDialog(QDialog):
         layout.addWidget(buttons)
 
         if data:
-            # data should be (title, author, rack_column_row, year, isbn)
-            title, author, rack_column_row, year, isbn = data
+            # data should be (title, author, status, rack_column_row, year, isbn)
+            title, author, status, rack_column_row, year, isbn = data
             self.title_edit.setText(title or "")
             self.author_edit.setText(author or "")
+            # set status if present in list, otherwise add it
+            if status:
+                idx = self.status_box.findText(status)
+                if idx >= 0:
+                    self.status_box.setCurrentIndex(idx)
+                else:
+                    self.status_box.addItem(status)
+                    self.status_box.setCurrentText(status)
             self.rack_column_row_edit.setText(rack_column_row or "")
             self.year_edit.setText(str(year) if year is not None else "")
-            self.isbn_edit.setText(isbn or "")
+            # isbn may be stored as integer in the DB — convert to str for setText
+            self.isbn_edit.setText(str(isbn) if isbn is not None else "")
 
         self.setLayout(layout)
 
@@ -404,8 +708,59 @@ class BookEditDialog(QDialog):
         return (
             self.title_edit.text().strip(),
             self.author_edit.text().strip(),
+            self.status_box.currentText().strip(),
             self.rack_column_row_edit.text().strip(),
             year,
             self.isbn_edit.text().strip(),
         )
+
+    
+
+class ClientEditDialog(QDialog):
+    def __init__(self, parent=None, data=None):
+        super().__init__(parent)
+        self.setWindowTitle("Client")
+        self.resize(360, 160)
+        layout = QVBoxLayout()
+
+        layout.addWidget(QLabel("Username:"))
+        self.username_edit = QLineEdit()
+        layout.addWidget(self.username_edit)
+
+        layout.addWidget(QLabel("Password:"))
+        self.password_edit = QLineEdit()
+        self.password_edit.setEchoMode(QLineEdit.Password)
+        layout.addWidget(self.password_edit)
+
+        layout.addWidget(QLabel("Email:"))
+        self.email_edit = QLineEdit()
+        layout.addWidget(self.email_edit)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        if data:
+            username, password, email = data
+            self.username_edit.setText(username or "")
+            # password may be stored hashed; leave blank by default to keep existing
+            self.password_edit.setText(password or "")
+            self.email_edit.setText(email or "")
+
+        self.setLayout(layout)
+
+    def accept(self):
+        if not self.username_edit.text().strip():
+            QMessageBox.warning(self, "Validation", "Username required")
+            return
+        super().accept()
+
+    def get_data(self):
+        return (
+            self.username_edit.text().strip(),
+            self.password_edit.text(),
+            self.email_edit.text().strip(),
+        )
+
 
