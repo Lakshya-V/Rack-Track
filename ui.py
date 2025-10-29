@@ -175,7 +175,7 @@ class AdminWindow(QMainWindow):
     def __init__(self, username, parent=None):
         super().__init__(parent)
         self.setWindowTitle(f"Admin - {username}")
-        self.resize(700, 500)
+        self.resize(1200, 800)
         central = QWidget()
         layout = QVBoxLayout()
         self.tab = QTabWidget()
@@ -183,21 +183,55 @@ class AdminWindow(QMainWindow):
         tab1_content = QWidget()
         tab1_layout = QVBoxLayout()
         tab1_content.setLayout(tab1_layout)
-        # Search controls
-        tab1_layout.search_input = QLineEdit(self)
-        tab1_layout.search_input.setPlaceholderText("Enter title, author, year or ISBN to search")
-        tab1_layout.addWidget(tab1_layout.search_input)
 
-        tab1_layout.search_button = QPushButton("SEARCH BOOK", self)
-        tab1_layout.addWidget(tab1_layout.search_button)
-        tab1_layout.search_button.clicked.connect(self.search_book)
+        # top row: left = search controls, right = vertical action buttons
+        top_row = QHBoxLayout()
+        left_col = QVBoxLayout()
+        right_buttons = QVBoxLayout()
+
+        # Search controls (left)
+        left_col.search_input = QLineEdit(self)
+        left_col.search_input.setPlaceholderText("Enter title, author, year or ISBN to search")
+        left_col.addWidget(left_col.search_input)
+
+        left_col.search_button = QPushButton("SEARCH BOOK", self)
+        left_col.search_button.setStyleSheet("margin-top: 0px; margin-bottom: 5px;padding:10px; font-size:15px;")
+        left_col.show_all = QPushButton("SHOW ALL BOOKS", self)
+        left_col.show_all.setStyleSheet("margin-top: 0px; margin-bottom: 5px;padding:10px; font-size:15px;")
+        left_col.addWidget(left_col.search_button)
+        left_col.addWidget(left_col.show_all)
+
+        # Vertical action buttons (right)
+        right_buttons.available = QPushButton("AVAILABLE BOOKS")
+        right_buttons.issue = QPushButton("ISSUED BOOKS")
+        right_buttons.lost = QPushButton("LOST BOOKS")
+        right_buttons.addWidget(right_buttons.available)
+        right_buttons.addWidget(right_buttons.issue)
+        right_buttons.addWidget(right_buttons.lost)
+        right_buttons.setAlignment(Qt.AlignTop)
+
+        top_row.addLayout(left_col)
+        top_row.addLayout(right_buttons)
+        tab1_layout.addLayout(top_row)
+
+        tab1_layout.search_input = left_col.search_input
+        tab1_layout.search_button = left_col.search_button
+        tab1_layout.show_all = left_col.show_all
+        tab1_layout.available = right_buttons.available
+        tab1_layout.issue = right_buttons.issue
+        tab1_layout.lost = right_buttons.lost
+
+        left_col.search_button.clicked.connect(self.search_book)
+        left_col.show_all.clicked.connect(self.show_books)
+        right_buttons.issue.clicked.connect(self.show_issued_books)
+        right_buttons.lost.clicked.connect(self.show_lost_books)
+        right_buttons.available.clicked.connect(self.show_available_books)
 
         # Results area (show labelled results including status)
         tab1_layout.result_label = QLabel("", self)
         tab1_layout.result_label.setWordWrap(True)
         tab1_layout.addWidget(tab1_layout.result_label)
 
-        # Note: QMainWindow uses setCentralWidget; don't call setLayout on it
         self.tab.addTab(tab1_content, "Search Book")
 
         # Create the second tab
@@ -292,6 +326,78 @@ class AdminWindow(QMainWindow):
             self.client_table.setHorizontalHeaderLabels([c.upper() for c in self._client_columns])
             self.load_clients()
 
+    def show_lost_books(self):
+        local_cur = connection.cursor()
+        try :
+            local_cur.execute("SELECT * FROM book WHERE status = 'lost'")
+            data = local_cur.fetchall()
+        finally:
+            local_cur.close()
+        if not data:
+            self.tab.widget(0).layout().result_label.setText("No lost books found.")
+            return
+        out = []
+        for r in data:
+            # sqlite3.Row will raise if a column name doesn't exist; handle older DBs gracefully
+            keys = list(r.keys())
+            r_id = r['id'] if 'id' in keys else ''
+            title = r['title'] if 'title' in keys else ''
+            author = r['author'] if 'author' in keys else ''
+            status = r['status'] if 'status' in keys else ''
+            rcr = r['rack_column_row'] if 'rack_column_row' in keys else ''
+            year_val = r['year'] if 'year' in keys else ''
+            isbn = r['isbn'] if 'isbn' in keys else ''
+            out.append(f"{r_id or isbn}: {title}\n  Author: {author} | Status: {status} | Rack: {rcr} | Year: {year_val} | ISBN: {isbn}")
+        self.tab.widget(0).layout().result_label.setText("\n\n".join(out))
+    def show_issued_books(self):
+        local_cur = connection.cursor()
+        try :
+            local_cur.execute("SELECT * FROM book WHERE status = 'issued'")
+            data = local_cur.fetchall()
+        finally:
+            local_cur.close()
+        if not data:
+            self.tab.widget(0).layout().result_label.setText("No issued books found.")
+            return
+        out = []
+        for r in data:
+            # sqlite3.Row will raise if a column name doesn't exist; handle older DBs gracefully
+            keys = list(r.keys())
+            r_id = r['id'] if 'id' in keys else ''
+            title = r['title'] if 'title' in keys else ''
+            author = r['author'] if 'author' in keys else ''
+            status = r['status'] if 'status' in keys else ''
+            rcr = r['rack_column_row'] if 'rack_column_row' in keys else ''
+            year_val = r['year'] if 'year' in keys else ''
+            isbn = r['isbn'] if 'isbn' in keys else ''
+            out.append(f"{r_id or isbn}: {title}\n  Author: {author} | Status: {status} | Rack: {rcr} | Year: {year_val} | ISBN: {isbn}")
+        self.tab.widget(0).layout().result_label.setText("\n\n".join(out))
+
+    # ...existing code...
+    def show_available_books(self):
+        local_cur = connection.cursor()
+        try:
+            local_cur.execute("SELECT * FROM book WHERE status = 'available'")
+            data = local_cur.fetchall()
+        finally:
+            local_cur.close()
+        if not data:
+            self.tab.widget(0).layout().result_label.setText("No available books found.")
+            return
+        out = []
+        for r in data:
+            keys = list(r.keys())
+            r_id = r['id'] if 'id' in keys else ''
+            title = r['title'] if 'title' in keys else ''
+            author = r['author'] if 'author' in keys else ''
+            status = r['status'] if 'status' in keys else ''
+            rcr = r['rack_column_row'] if 'rack_column_row' in keys else ''
+            year_val = r['year'] if 'year' in keys else ''
+            isbn = r['isbn'] if 'isbn' in keys else ''
+            out.append(f"{r_id or isbn}: {title}\n  Author: {author} | Status: {status} | Rack: {rcr} | Year: {year_val} | ISBN: {isbn}")
+        self.tab.widget(0).layout().result_label.setText("\n\n".join(out))
+# ...existing code...
+
     def _detect_book_columns(self):
         """Return list of book columns in preferred order depending on DB."""
         cur = connection.cursor()
@@ -307,6 +413,34 @@ class AdminWindow(QMainWindow):
             if c not in ordered:
                 ordered.append(c)
         return ordered
+
+    def show_books(self) :
+        local_cur = connection.cursor()
+        try :
+            local_cur.execute("SELECT * FROM book")
+            data = local_cur.fetchall()
+        finally :
+            local_cur.close()
+
+        if not data:
+            self.tab.widget(0).layout().result_label.setText("No books found.")
+            return
+
+        out = []
+        for r in data:
+            # sqlite3.Row will raise if a column name doesn't exist; handle older DBs gracefully
+            keys = list(r.keys())
+            r_id = r['id'] if 'id' in keys else ''
+            title = r['title'] if 'title' in keys else ''
+            author = r['author'] if 'author' in keys else ''
+            status = r['status'] if 'status' in keys else ''
+            rcr = r['rack_column_row'] if 'rack_column_row' in keys else ''
+            year_val = r['year'] if 'year' in keys else ''
+            isbn = r['isbn'] if 'isbn' in keys else ''
+            out.append(f"{r_id or isbn}: {title}\n  Author: {author} | Status: {status} | Rack: {rcr} | Year: {year_val} | ISBN: {isbn}")
+        self.tab.widget(0).layout().result_label.setText("\n\n".join(out))
+
+
 
     def load_books(self, filter_text=''):
         """Populate the book_table with rows matching optional filter_text."""
@@ -616,7 +750,7 @@ class ClientWindow(QMainWindow):
     def __init__(self, username="", parent=None):
         super().__init__(parent)
         self.setWindowTitle(f"Client - {username}")
-        self.resize(700, 500)
+        self.resize(1200, 800)
         central = QWidget()
         layout = QVBoxLayout()
         self.tab = QTabWidget()
