@@ -22,9 +22,38 @@ from PyQt5.QtGui import (
     QFont,
 )
 import sqlite3       
+from datetime import datetime
+from datetime import timedelta
 
 connection = sqlite3.connect("rack-track.db")
 connection.row_factory = sqlite3.Row # to access columns by name
+
+
+def ensure_loans_table():
+    """Create a simple loans table for issue/return tracking if it doesn't exist."""
+    cur = connection.cursor()
+    try:
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS loans (
+                loan_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                client_id INTEGER,
+                client_username TEXT,
+                book_pk TEXT,
+                book_title TEXT,
+                issued_at TEXT,
+                due_date TEXT,
+                returned_at TEXT
+            )
+            """
+        )
+        connection.commit()
+    finally:
+        cur.close()
+
+# loan policy defaults
+MAX_LOANS = 5
+LOAN_DAYS = 14
 
 class MainWindow(QMainWindow):
     """Initial window with Admin and Client buttons."""
@@ -76,6 +105,152 @@ class MainWindow(QMainWindow):
         admin_btn.clicked.connect(self.open_admin)
         client_btn.clicked.connect(self.open_client)
 
+    # ---- Client window helpers: search, checkout, my loans ----
+    def _detect_book_columns_client(self):
+        cur = connection.cursor()
+        try:
+            cur.execute("PRAGMA table_info(book)")
+            cols = [row[1] for row in cur.fetchall()]
+        finally:
+            cur.close()
+        preferred = ['id', 'title', 'author', 'status', 'rack_column_row', 'year', 'isbn']
+        ordered = [c for c in preferred if c in cols]
+        for c in cols:
+            if c not in ordered:
+                ordered.append(c)
+        return ordered
+
+    def load_search_results(self, filter_text=''):
+        cols = self._detect_book_columns_client()
+        if not cols:
+            return
+        sel_sql = ",".join(cols)
+        sql = f"SELECT {sel_sql} FROM book"
+        params = ()
+        if filter_text:
+            sql += " WHERE title LIKE ? OR author LIKE ? OR isbn LIKE ?"
+            params = (f"%{filter_text}%", f"%{filter_text}%", f"%{filter_text}%")
+        cur = connection.cursor()
+        try:
+            cur.execute(sql, params)
+            rows = cur.fetchall()
+        finally:
+            cur.close()
+
+        self.search_table.setColumnCount(len(cols))
+        self.search_table.setHorizontalHeaderLabels([c.upper() for c in cols])
+        self.search_table.setRowCount(len(rows))
+        for r_i, r in enumerate(rows):
+            for c_i, col in enumerate(cols):
+                val = r[col] if col in r.keys() else ''
+                self.search_table.setItem(r_i, c_i, QTableWidgetItem(str(val) if val is not None else ''))
+
+    def checkout_selected(self):
+        # ensure loans table
+        ensure_loans_table()
+        # find selected book in search_table
+        selected = self.search_table.selectedItems()
+        if not selected:
+            QMessageBox.warning(self, "Select book", "Please select a book to check out.")
+            return
+        row_idx = selected[0].row()
+        # assume first column is pk (id or isbn)
+        pk_val = self.search_table.item(row_idx, 0).text()
+        # get title
+        title = self.search_table.item(row_idx, 1).text() if self.search_table.columnCount() > 1 else ''
+        # determine client id/username stored on this window
+        client_id = getattr(self, 'client_id', None)
+        client_username = getattr(self, 'username', '')
+
+        # check book availability
+        cur = connection.cursor()
+        try:
+            cur.execute("SELECT * FROM book WHERE isbn = ? OR id = ?", (pk_val, pk_val))
+            book_row = cur.fetchone()
+        finally:
+            cur.close()
+        if book_row and 'status' in book_row.keys() and book_row['status'] == 'checked out':
+            QMessageBox.warning(self, "Unavailable", "Book is already checked out.")
+            return
+
+        # enforce max loans per client
+        cur = connection.cursor()
+        try:
+            if client_id is not None:
+                cur.execute("SELECT COUNT(*) FROM loans WHERE client_id = ? AND returned_at IS NULL", (client_id,))
+            else:
+                cur.execute("SELECT COUNT(*) FROM loans WHERE client_username = ? AND returned_at IS NULL", (client_username,))
+            out_count = cur.fetchone()[0]
+        finally:
+            cur.close()
+
+        if out_count >= MAX_LOANS:
+            QMessageBox.warning(self, "Limit reached", f"You already have {out_count} outstanding loans (max {MAX_LOANS}). Return some books before checking out more.")
+            return
+
+        # insert loan with due date and mark book checked out
+        issued_at = datetime.now()
+        due = (issued_at + timedelta(days=LOAN_DAYS)).isoformat()
+        issued_at_iso = issued_at.isoformat()
+        cur = connection.cursor()
+        try:
+            cur.execute(
+                "INSERT INTO loans (client_id, client_username, book_pk, book_title, issued_at, due_date, returned_at) VALUES (?,?,?,?,?,?,NULL)",
+                (client_id, client_username, pk_val, title, issued_at_iso, due),
+            )
+            cur.execute("UPDATE book SET status = 'checked out' WHERE isbn = ? OR id = ?", (pk_val, pk_val))
+            connection.commit()
+        finally:
+            cur.close()
+
+        QMessageBox.information(self, "Checked out", "Book checked out successfully.")
+        # refresh my loans and search results
+        self.load_my_loans()
+        self.load_search_results(self.search_table.item(row_idx, 0).text())
+
+    def load_my_loans(self):
+        ensure_loans_table()
+        cur = connection.cursor()
+        try:
+            if getattr(self, 'client_id', None) is not None:
+                cur.execute("SELECT loan_id, book_pk, book_title, issued_at, due_date, returned_at FROM loans WHERE client_id = ? ORDER BY issued_at DESC", (self.client_id,))
+            else:
+                cur.execute("SELECT loan_id, book_pk, book_title, issued_at, due_date, returned_at FROM loans WHERE client_username = ? ORDER BY issued_at DESC", (getattr(self, 'username', ''),))
+            rows = cur.fetchall()
+        finally:
+            cur.close()
+
+        cols = ['LOAN_ID', 'BOOK', 'TITLE', 'ISSUED_AT', 'DUE_DATE', 'RETURNED_AT']
+        self.my_loans_table.setColumnCount(len(cols))
+        self.my_loans_table.setHorizontalHeaderLabels(cols)
+        self.my_loans_table.setRowCount(len(rows))
+        for r_i, r in enumerate(rows):
+            self.my_loans_table.setItem(r_i, 0, QTableWidgetItem(str(r['loan_id'])))
+            self.my_loans_table.setItem(r_i, 1, QTableWidgetItem(str(r['book_pk'])))
+            self.my_loans_table.setItem(r_i, 2, QTableWidgetItem(str(r['book_title'])))
+            self.my_loans_table.setItem(r_i, 3, QTableWidgetItem(str(r['issued_at'])))
+            self.my_loans_table.setItem(r_i, 4, QTableWidgetItem(str(r.get('due_date') or '')))
+            self.my_loans_table.setItem(r_i, 5, QTableWidgetItem(str(r['returned_at'] or '')))
+
+    def return_selected(self):
+        selected = self.my_loans_table.selectedItems()
+        if not selected:
+            QMessageBox.warning(self, "Select loan", "Please select a loan to return.")
+            return
+        row_idx = selected[0].row()
+        loan_id = self.my_loans_table.item(row_idx, 0).text()
+        book_pk = self.my_loans_table.item(row_idx, 1).text()
+        now = datetime.now().isoformat()
+        cur = connection.cursor()
+        try:
+            cur.execute("UPDATE loans SET returned_at = ? WHERE loan_id = ?", (now, loan_id))
+            cur.execute("UPDATE book SET status = 'available' WHERE isbn = ? OR id = ?", (book_pk, book_pk))
+            connection.commit()
+        finally:
+            cur.close()
+        QMessageBox.information(self, "Returned", "Book marked as returned.")
+        self.load_my_loans()
+
         # keep a reference to any opened child window so it doesn't get garbage collected
         self._child_window = None
 
@@ -113,16 +288,16 @@ class MainWindow(QMainWindow):
             if dlg.exec() != QDialog.Accepted:
                 return
             username,password = dlg.get_credentials()          
-
             local_cur = connection.cursor()
-            try :
-                local_cur.execute("SELECT 1 FROM client WHERE username = ? AND password = ?", (username, password))
-                result = local_cur.fetchone()
-            finally :
+            try:
+                local_cur.execute("SELECT client_id FROM client WHERE username = ? AND password = ?", (username, password))
+                row = local_cur.fetchone()
+            finally:
                 local_cur.close()
 
-            if result:
-                client_window = ClientWindow(username=username, parent=self)
+            if row:
+                client_id = row['client_id'] if 'client_id' in row.keys() else None
+                client_window = ClientWindow(client_id=client_id, username=username, parent=self)
                 client_window.show()
                 self._child_window = client_window
                 return
@@ -203,7 +378,7 @@ class AdminWindow(QMainWindow):
 
         # Vertical action buttons (right)
         right_buttons.available = QPushButton("AVAILABLE BOOKS")
-        right_buttons.issue = QPushButton("ISSUED BOOKS")
+        right_buttons.issue = QPushButton("CHECKED OUT BOOKS")
         right_buttons.lost = QPushButton("LOST BOOKS")
         right_buttons.addWidget(right_buttons.available)
         right_buttons.addWidget(right_buttons.issue)
@@ -308,6 +483,21 @@ class AdminWindow(QMainWindow):
         # add the tab
         self.tab.addTab(tab3_content, "Manage Clients")
 
+        # --- Issue summary tab for admin: who issued how many books ---
+        tab4_content = QWidget()
+        tab4_layout = QVBoxLayout()
+        tab4_content.setLayout(tab4_layout)
+        tab4_layout.addWidget(QLabel("Issue Summary (who issued how many books)"))
+        tab4_layout.refresh_btn = QPushButton("Refresh")
+        tab4_layout.addWidget(tab4_layout.refresh_btn)
+
+        self.issue_table = QTableWidget()
+        self.issue_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        tab4_layout.addWidget(self.issue_table)
+
+        tab4_layout.refresh_btn.clicked.connect(self.load_issue_summary)
+        self.tab.addTab(tab4_content, "Issue Summary")
+
         layout.addWidget(QLabel(f"Welcome Admin: {username}"))
         central.setLayout(layout)
         self.setCentralWidget(central)
@@ -325,6 +515,12 @@ class AdminWindow(QMainWindow):
             self.client_table.setColumnCount(len(self._client_columns))
             self.client_table.setHorizontalHeaderLabels([c.upper() for c in self._client_columns])
             self.load_clients()
+        # load issue summary table
+        try:
+            self.load_issue_summary()
+        except Exception:
+            # non-fatal if loans table missing or other issue
+            pass
 
     def show_lost_books(self):
         local_cur = connection.cursor()
@@ -352,12 +548,12 @@ class AdminWindow(QMainWindow):
     def show_issued_books(self):
         local_cur = connection.cursor()
         try :
-            local_cur.execute("SELECT * FROM book WHERE status = 'issued'")
+            local_cur.execute("SELECT * FROM book WHERE status = 'checked out'")
             data = local_cur.fetchall()
         finally:
             local_cur.close()
         if not data:
-            self.tab.widget(0).layout().result_label.setText("No issued books found.")
+            self.tab.widget(0).layout().result_label.setText("No checked out books found.")
             return
         out = []
         for r in data:
@@ -471,6 +667,45 @@ class AdminWindow(QMainWindow):
         # disable edit/remove when nothing is selected; UI selection handler toggles these
         self.tab.widget(1).layout().edit_btn.setEnabled(False)
         self.tab.widget(1).layout().remove_btn.setEnabled(False)
+
+    def load_issue_summary(self):
+        """Populate the admin issue summary table showing number of outstanding loans per client."""
+        ensure_loans_table()
+        cur = connection.cursor()
+        try:
+            cur.execute(
+                "SELECT client_id, client_username, COUNT(*) as issued_count FROM loans WHERE returned_at IS NULL GROUP BY client_id, client_username ORDER BY issued_count DESC"
+            )
+            rows = cur.fetchall()
+        finally:
+            cur.close()
+        # also compute overdue counts per client (due_date < now and not returned)
+        now_iso = datetime.now().isoformat()
+        cur = connection.cursor()
+        overdue_map = {}
+        try:
+            cur.execute(
+                "SELECT client_id, client_username, COUNT(*) as overdue_count FROM loans WHERE returned_at IS NULL AND due_date IS NOT NULL AND due_date < ? GROUP BY client_id, client_username",
+                (now_iso,)
+            )
+            overdue_rows = cur.fetchall()
+            for orow in overdue_rows:
+                key = (orow['client_id'], orow['client_username'])
+                overdue_map[key] = orow['overdue_count']
+        finally:
+            cur.close()
+
+        cols = ['CLIENT', 'ISSUED_COUNT', 'OVERDUE']
+        self.issue_table.setColumnCount(len(cols))
+        self.issue_table.setHorizontalHeaderLabels(cols)
+        self.issue_table.setRowCount(len(rows))
+        for r_i, r in enumerate(rows):
+            client = r['client_username'] if 'client_username' in r.keys() and r['client_username'] else (str(r['client_id']) if 'client_id' in r.keys() and r['client_id'] else 'unknown')
+            count = r['issued_count'] if 'issued_count' in r.keys() else ''
+            overdue = overdue_map.get((r['client_id'], r['client_username']), 0)
+            self.issue_table.setItem(r_i, 0, QTableWidgetItem(str(client)))
+            self.issue_table.setItem(r_i, 1, QTableWidgetItem(str(count)))
+            self.issue_table.setItem(r_i, 2, QTableWidgetItem(str(overdue)))
 
     def _on_book_selection_changed(self):
         has = bool(self.book_table.selectedItems())
@@ -747,8 +982,11 @@ class AdminWindow(QMainWindow):
 
 
 class ClientWindow(QMainWindow):
-    def __init__(self, username="", parent=None):
+    def __init__(self, client_id=None, username="", parent=None):
         super().__init__(parent)
+        # store client identity (may be None if unavailable)
+        self.client_id = client_id
+        self.username = username
         self.setWindowTitle(f"Client - {username}")
         self.resize(1200, 800)
         central = QWidget()
@@ -758,18 +996,206 @@ class ClientWindow(QMainWindow):
         tab1_content = QWidget()
         tab1_layout = QVBoxLayout()
         tab1_content.setLayout(tab1_layout)
-        tab1_layout.addWidget(QLabel("This is the content of Tab 1."))
-        self.tab.addTab(tab1_content, "Tab 1 Title")
+        tab1_layout.search_input = QLineEdit(self)
+        tab1_layout.search_input.setPlaceholderText("Enter title, author, year or ISBN to search")
+        tab1_layout.addWidget(tab1_layout.search_input)
 
-        # Create the second tab
+        tab1_layout.search_button = QPushButton("SEARCH BOOK", self)
+        tab1_layout.search_button.setStyleSheet("margin-top: 0px; margin-bottom: 5px;padding:10px; font-size:15px;")
+        tab1_layout.show_all = QPushButton("SHOW ALL BOOKS", self)
+        tab1_layout.show_all.setStyleSheet("margin-top: 0px; margin-bottom: 5px;padding:10px; font-size:15px;")
+        tab1_layout.addWidget(tab1_layout.search_button)
+        tab1_layout.addWidget(tab1_layout.show_all)
+        # search results table for checkout
+        self.search_table = QTableWidget()
+        self.search_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.search_table.setSelectionMode(QTableWidget.SingleSelection)
+        self.search_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        tab1_layout.addWidget(self.search_table)
+
+        # checkout button
+        tab1_layout.checkout_btn = QPushButton("Check Out Selected")
+        tab1_layout.checkout_btn.setStyleSheet("padding:8px; font-size:14px;")
+        tab1_layout.addWidget(tab1_layout.checkout_btn)
+        self.tab.addTab(tab1_content, "Search Books")
+
+        # Create the My Loans tab for this client
         tab2_content = QWidget()
         tab2_layout = QVBoxLayout()
         tab2_content.setLayout(tab2_layout)
-        tab2_layout.addWidget(QLabel("This is the content of Tab 2."))
-        self.tab.addTab(tab2_content, "Tab 2 Title")
+        tab2_layout.addWidget(QLabel("My Loans"))
+        tab2_layout.refresh_btn = QPushButton("Refresh")
+        tab2_layout.addWidget(tab2_layout.refresh_btn)
+
+        self.my_loans_table = QTableWidget()
+        self.my_loans_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.my_loans_table.setSelectionMode(QTableWidget.SingleSelection)
+        self.my_loans_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        tab2_layout.addWidget(self.my_loans_table)
+
+        tab2_layout.return_btn = QPushButton("Return Selected")
+        tab2_layout.addWidget(tab2_layout.return_btn)
+
+        self.tab.addTab(tab2_content, "My Loans")
+
+        # wire client search/checkout and loans buttons
+        tab1_layout.search_button.clicked.connect(lambda: self.load_search_results(tab1_layout.search_input.text().strip()))
+        tab1_layout.show_all.clicked.connect(lambda: self.load_search_results(''))
+        tab1_layout.checkout_btn.clicked.connect(self.checkout_selected)
+        tab2_layout.refresh_btn.clicked.connect(self.load_my_loans)
+        tab2_layout.return_btn.clicked.connect(self.return_selected)
+
         layout.addWidget(QLabel(f"Welcome Client: {username}"))
         central.setLayout(layout)
         self.setCentralWidget(central)
+
+    def checkout_selected(self):
+        # ensure loans table
+        ensure_loans_table()
+        # find selected book in search_table
+        selected = self.search_table.selectedItems()
+        if not selected:
+            QMessageBox.warning(self, "Select book", "Please select a book to check out.")
+            return
+        row_idx = selected[0].row()
+        # assume first column is pk (id or isbn)
+        pk_val = self.search_table.item(row_idx, 0).text()
+        # get title
+        title = self.search_table.item(row_idx, 1).text() if self.search_table.columnCount() > 1 else ''
+        # determine client id/username stored on this window
+        client_id = getattr(self, 'client_id', None)
+        client_username = getattr(self, 'username', '')
+
+        # check book availability
+        cur = connection.cursor()
+        try:
+            cur.execute("SELECT * FROM book WHERE isbn = ? OR id = ?", (pk_val, pk_val))
+            book_row = cur.fetchone()
+        finally:
+            cur.close()
+        if book_row and 'status' in book_row.keys() and book_row['status'] == 'checked out':
+            QMessageBox.warning(self, "Unavailable", "Book is already checked out.")
+            return
+
+        # enforce max loans per client
+        cur = connection.cursor()
+        try:
+            if client_id is not None:
+                cur.execute("SELECT COUNT(*) FROM loans WHERE client_id = ? AND returned_at IS NULL", (client_id,))
+            else:
+                cur.execute("SELECT COUNT(*) FROM loans WHERE client_username = ? AND returned_at IS NULL", (client_username,))
+            out_count = cur.fetchone()[0]
+        finally:
+            cur.close()
+
+        if out_count >= MAX_LOANS:
+            QMessageBox.warning(self, "Limit reached", f"You already have {out_count} outstanding loans (max {MAX_LOANS}). Return some books before checking out more.")
+            return
+
+        # insert loan with due date and mark book checked out
+        issued_at = datetime.now()
+        due = (issued_at + timedelta(days=LOAN_DAYS)).isoformat()
+        issued_at_iso = issued_at.isoformat()
+        cur = connection.cursor()
+        try:
+            cur.execute(
+                "INSERT INTO loans (client_id, client_username, book_pk, book_title, issued_at, due_date, returned_at) VALUES (?,?,?,?,?,?,NULL)",
+                (client_id, client_username, pk_val, title, issued_at_iso, due),
+            )
+            cur.execute("UPDATE book SET status = 'checked out' WHERE isbn = ? OR id = ?", (pk_val, pk_val))
+            connection.commit()
+        finally:
+            cur.close()
+
+        QMessageBox.information(self, "Checked out", "Book checked out successfully.")
+        # refresh my loans and search results
+        self.load_my_loans()
+        self.load_search_results(self.search_table.item(row_idx, 0).text())
+
+    def load_my_loans(self):
+        ensure_loans_table()
+        cur = connection.cursor()
+        try:
+            if getattr(self, 'client_id', None) is not None:
+                cur.execute("SELECT loan_id, book_pk, book_title, issued_at, due_date, returned_at FROM loans WHERE client_id = ? ORDER BY issued_at DESC", (self.client_id,))
+            else:
+                cur.execute("SELECT loan_id, book_pk, book_title, issued_at, due_date, returned_at FROM loans WHERE client_username = ? ORDER BY issued_at DESC", (getattr(self, 'username', ''),))
+            rows = cur.fetchall()
+        finally:
+            cur.close()
+
+        cols = ['LOAN_ID', 'BOOK', 'TITLE', 'ISSUED_AT', 'DUE_DATE', 'RETURNED_AT']
+        self.my_loans_table.setColumnCount(len(cols))
+        self.my_loans_table.setHorizontalHeaderLabels(cols)
+        self.my_loans_table.setRowCount(len(rows))
+        for r_i, r in enumerate(rows):
+            self.my_loans_table.setItem(r_i, 0, QTableWidgetItem(str(r['loan_id'])))
+            self.my_loans_table.setItem(r_i, 1, QTableWidgetItem(str(r['book_pk'])))
+            self.my_loans_table.setItem(r_i, 2, QTableWidgetItem(str(r['book_title'])))
+            self.my_loans_table.setItem(r_i, 3, QTableWidgetItem(str(r['issued_at'])))
+            self.my_loans_table.setItem(r_i, 4, QTableWidgetItem(str(r.get('due_date') or '')))
+            self.my_loans_table.setItem(r_i, 5, QTableWidgetItem(str(r['returned_at'] or '')))
+
+    def return_selected(self):
+        selected = self.my_loans_table.selectedItems()
+        if not selected:
+            QMessageBox.warning(self, "Select loan", "Please select a loan to return.")
+            return
+        row_idx = selected[0].row()
+        loan_id = self.my_loans_table.item(row_idx, 0).text()
+        book_pk = self.my_loans_table.item(row_idx, 1).text()
+        now = datetime.now().isoformat()
+        cur = connection.cursor()
+        try:
+            cur.execute("UPDATE loans SET returned_at = ? WHERE loan_id = ?", (now, loan_id))
+            cur.execute("UPDATE book SET status = 'available' WHERE isbn = ? OR id = ?", (book_pk, book_pk))
+            connection.commit()
+        finally:
+            cur.close()
+        QMessageBox.information(self, "Returned", "Book marked as returned.")
+        self.load_my_loans()
+
+        # keep a reference to any opened child window so it doesn't get garbage collected
+        self._child_window = None
+
+    def _detect_book_columns_client(self):
+        cur = connection.cursor()
+        try:
+            cur.execute("PRAGMA table_info(book)")
+            cols = [row[1] for row in cur.fetchall()]
+        finally:
+            cur.close()
+        preferred = ['id', 'title', 'author', 'status', 'rack_column_row', 'year', 'isbn']
+        ordered = [c for c in preferred if c in cols]
+        for c in cols:
+            if c not in ordered:
+                ordered.append(c)
+        return ordered
+
+    def load_search_results(self, filter_text=''):
+        cols = self._detect_book_columns_client()
+        if not cols:
+            return
+        sel_sql = ",".join(cols)
+        sql = f"SELECT {sel_sql} FROM book"
+        params = ()
+        if filter_text:
+            sql += " WHERE title LIKE ? OR author LIKE ? OR isbn LIKE ?"
+            params = (f"%{filter_text}%", f"%{filter_text}%", f"%{filter_text}%")
+        cur = connection.cursor()
+        try:
+            cur.execute(sql, params)
+            rows = cur.fetchall()
+        finally:
+            cur.close()
+
+        self.search_table.setColumnCount(len(cols))
+        self.search_table.setHorizontalHeaderLabels([c.upper() for c in cols])
+        self.search_table.setRowCount(len(rows))
+        for r_i, r in enumerate(rows):
+            for c_i, col in enumerate(cols):
+                val = r[col] if col in r.keys() else ''
+                self.search_table.setItem(r_i, c_i, QTableWidgetItem(str(val) if val is not None else ''))
 
 
 class BookEditDialog(QDialog):
