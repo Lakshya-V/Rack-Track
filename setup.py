@@ -1,40 +1,90 @@
-import sqlite3
+import csv
 import os
+import sqlite3
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "rack-track.db")
+CSV_FILE = os.path.join(os.path.dirname(__file__), "library_dataset_random.csv")
+# If True the script wipes `book` before importing. Set to False to preserve existing rows.
+REPLACE_BOOKS = True
 
-conn = sqlite3.connect(DB_PATH)
-cur = conn.cursor()
 
-# client and admin tables (simple, non-hashed passwords for initial seeds)
-cur.execute(
-    "CREATE TABLE IF NOT EXISTS client (client_id INTEGER PRIMARY KEY AUTOINCREMENT, username VARCHAR(255), password VARCHAR(255), email VARCHAR(255) UNIQUE);"
-)
-cur.execute(
-    "CREATE TABLE IF NOT EXISTS admin (admin_id INTEGER PRIMARY KEY AUTOINCREMENT, username VARCHAR(255), password VARCHAR(255), email VARCHAR(255) UNIQUE);"
-)
-# book table — keep isbn INT PRIMARY KEY to match earlier UI expectations
-cur.execute(
-    "CREATE TABLE IF NOT EXISTS book (title VARCHAR(255), author VARCHAR(255), status VARCHAR(255), rack_column_row VARCHAR(255), year INT, isbn INT PRIMARY KEY);"
-)
-# loans table for checkouts/returns (due_date stored as ISO string)
-cur.execute(
-    "CREATE TABLE IF NOT EXISTS loans (\n        loan_id INTEGER PRIMARY KEY AUTOINCREMENT,\n        client_id INTEGER,\n        client_username TEXT,\n        book_pk TEXT,\n        book_title TEXT,\n        issued_at TEXT,\n        due_date TEXT,\n        returned_at TEXT\n    );"
-)
+def ensure_tables(conn):
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE IF NOT EXISTS client (client_id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT, password TEXT, email TEXT UNIQUE);")
+    cur.execute("CREATE TABLE IF NOT EXISTS admin (admin_id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT, password TEXT, email TEXT UNIQUE);")
+    cur.execute("CREATE TABLE IF NOT EXISTS book (title TEXT, author TEXT, status TEXT, rack_column_row TEXT, year INTEGER, isbn INTEGER PRIMARY KEY);")
+    cur.execute("CREATE TABLE IF NOT EXISTS loans (loan_id INTEGER PRIMARY KEY AUTOINCREMENT, client_id INTEGER, client_username TEXT, book_pk TEXT, book_title TEXT, issued_at TEXT, due_date TEXT, returned_at TEXT);")
+    # basic seeds
+    cur.execute("INSERT OR IGNORE INTO admin (admin_id, username, password, email) VALUES (?,?,?,?);", (1, 'admin', 'admin', 'admin@gmail.com'))
+    cur.execute("INSERT OR IGNORE INTO client (client_id, username, password, email) VALUES (?,?,?,?);", (1, 'a', 'a', 'a@gmail.com'))
+    conn.commit()
 
-# sample seed
-cur.execute(
-    "INSERT OR IGNORE INTO book (title, author, status, rack_column_row, year, isbn) values(?,?,?,?,?,?);",
-    ("The wonderful Wizard of Oz", "L. Frank Baum", "available", "1/1/1", 1900, 9780486280615),
-)
-cur.execute(
-    "INSERT OR IGNORE INTO client (client_id, username, password, email) values(?,?,?,?);",
-    (1, 'a', 'a', 'a@gmail.com'),
-)
-cur.execute(
-    "INSERT OR IGNORE INTO admin (admin_id, username, password, email) values(?,?,?,?);",
-    (1, 'admin', 'admin', 'admin@gmail.com'),
-)
 
-conn.commit()
-conn.close()
+def import_csv(conn, csv_path):
+    if not os.path.exists(csv_path):
+        print("CSV not found; skipping import.")
+        return 0
+    cur = conn.cursor()
+    inserted = 0
+    with open(csv_path, newline='', encoding='utf-8') as fh:
+        reader = csv.DictReader(fh)
+        for i, row in enumerate(reader):
+            title = (row.get('title') or row.get('Title') or '')[:255]
+            author = (row.get('author') or row.get('Author') or '')[:255]
+            year = row.get('year') or row.get('Year') or None
+            try:
+                year = int(year) if year else None
+            except Exception:
+                year = None
+            isbn = row.get('isbn') or row.get('ISBN')
+            try:
+                isbn = int(isbn) if isbn else None
+            except Exception:
+                isbn = None
+            if not isbn:
+                # fallback pseudo-isbn
+                isbn = 10**12 + i
+            try:
+                cur.execute(
+                    "INSERT OR IGNORE INTO book (title, author, status, rack_column_row, year, isbn) VALUES (?,?,?,?,?,?);",
+                    (title, author, 'available', '', year, isbn),
+                )
+                if cur.rowcount:
+                    inserted += 1
+            except Exception:
+                continue
+    conn.commit()
+    print(f"Imported {inserted} books from CSV.")
+    return inserted
+
+
+def ensure_book_id(conn):
+    cur = conn.cursor()
+    cur.execute("PRAGMA table_info(book);")
+    cols = [r[1] for r in cur.fetchall()]
+    if 'id' not in cols:
+        try:
+            cur.execute("ALTER TABLE book ADD COLUMN id INTEGER;")
+            cur.execute("UPDATE book SET id = rowid WHERE id IS NULL;")
+            cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_book_id ON book(id);")
+            conn.commit()
+        except Exception:
+            pass
+
+
+def main():
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        ensure_tables(conn)
+        if REPLACE_BOOKS:
+            print("REPLACE_BOOKS=True: wiping existing `book` rows.")
+            conn.execute("DELETE FROM book;")
+            conn.commit()
+        import_csv(conn, CSV_FILE)
+        ensure_book_id(conn)
+    finally:
+        conn.close()
+
+
+if __name__ == '__main__':
+    main()
