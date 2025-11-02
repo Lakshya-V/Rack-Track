@@ -14,7 +14,8 @@ from PyQt5.QtWidgets import (
     QTableWidget,
     QTableWidgetItem,
     QHeaderView,
-    QComboBox
+    QComboBox,
+    QScrollArea,
 )
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import (
@@ -50,6 +51,42 @@ def ensure_loans_table():
         connection.commit()
     finally:
         cur.close()
+
+
+def ensure_book_id_column():
+    """Ensure book table has an 'id' column. If missing, add it and populate from rowid.
+
+    This avoids OperationalError when code references 'id' alongside 'isbn'.
+    The added 'id' will not be the PRIMARY KEY (we keep existing isbn PK) but
+    will be populated with rowid values for stable numeric ids.
+    """
+    cur = connection.cursor()
+    try:
+        cur.execute("PRAGMA table_info(book)")
+        cols = [r[1] for r in cur.fetchall()]
+        if 'id' not in cols:
+            # add id column (nullable integer)
+            cur.execute("ALTER TABLE book ADD COLUMN id INTEGER")
+            # populate id from rowid for existing rows
+            try:
+                cur.execute("UPDATE book SET id = rowid WHERE id IS NULL")
+            except Exception:
+                # some sqlite builds or edge cases could fail; ignore but continue
+                pass
+            # create index for faster lookups
+            try:
+                cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_book_id ON book(id)")
+            except Exception:
+                pass
+            connection.commit()
+    finally:
+        cur.close()
+# ensure helpful compatibility columns exist at startup
+try:
+    ensure_loans_table()
+except Exception:
+    # if DB is locked or not writable, we'll attempt again later when needed
+    pass
 
 # loan policy defaults
 MAX_LOANS = 5
@@ -405,7 +442,16 @@ class AdminWindow(QMainWindow):
         # Results area (show labelled results including status)
         tab1_layout.result_label = QLabel("", self)
         tab1_layout.result_label.setWordWrap(True)
-        tab1_layout.addWidget(tab1_layout.result_label)
+        # Put the result label into a scroll area so long search outputs scroll
+        tab1_layout.scroll_area = QScrollArea()
+        tab1_layout.scroll_area.setWidgetResizable(True)
+        _result_container = QWidget()
+        _result_layout = QVBoxLayout()
+        _result_layout.setContentsMargins(0, 0, 0, 0)
+        _result_layout.addWidget(tab1_layout.result_label)
+        _result_container.setLayout(_result_layout)
+        tab1_layout.scroll_area.setWidget(_result_container)
+        tab1_layout.addWidget(tab1_layout.scroll_area)
 
         self.tab.addTab(tab1_content, "Search Book")
 
@@ -437,6 +483,10 @@ class AdminWindow(QMainWindow):
         tab2_layout.addWidget(self.book_table)
         # connect selection change handler once
         self.book_table.itemSelectionChanged.connect(self._on_book_selection_changed)
+
+        # ensure table scrollbars appear when needed
+        self.book_table.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.book_table.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
 
         # wire buttons
         tab2_layout.add_btn.clicked.connect(self.add_book_dialog)
@@ -470,6 +520,8 @@ class AdminWindow(QMainWindow):
         self.client_table.setSelectionMode(QTableWidget.SingleSelection)
         self.client_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         tab3_layout.addWidget(self.client_table)
+        self.client_table.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.client_table.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
 
         # wire client buttons
         tab3_layout.add_btn.clicked.connect(self.add_client_dialog)
@@ -500,7 +552,11 @@ class AdminWindow(QMainWindow):
 
         layout.addWidget(QLabel(f"Welcome Admin: {username}"))
         central.setLayout(layout)
-        self.setCentralWidget(central)
+        # Wrap the central widget in a scroll area so the admin UI is scrollable on small screens
+        admin_scroll = QScrollArea()
+        admin_scroll.setWidgetResizable(True)
+        admin_scroll.setWidget(central)
+        self.setCentralWidget(admin_scroll)
 
         # detect book columns and populate table
         self._book_columns = self._detect_book_columns()
@@ -1032,11 +1088,31 @@ class ClientWindow(QMainWindow):
         self.my_loans_table.setSelectionMode(QTableWidget.SingleSelection)
         self.my_loans_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         tab2_layout.addWidget(self.my_loans_table)
+        # ensure tables show scrollbars when content overflows
+        self.my_loans_table.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.my_loans_table.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
 
         tab2_layout.return_btn = QPushButton("Return Selected")
         tab2_layout.addWidget(tab2_layout.return_btn)
-
         self.tab.addTab(tab2_content, "My Loans")
+        tab3_content = QWidget()
+        tab3_layout = QVBoxLayout()
+        tab3_content.setLayout(tab3_layout)
+        tab3_layout.addWidget(QLabel("Profile Information"))
+        local_cur = connection.cursor()
+        try :
+            local_cur.execute("SELECT * FROM client WHERE client_id = ?", (client_id,))
+            connection.commit()
+            row = local_cur.fetchone()
+        finally :
+            local_cur.close()
+        tab3_layout.addWidget(QLabel(f"Username: {row['username'] if row and 'username' in row.keys() else ''}"))
+        tab3_layout.addWidget(QLabel(f"Email: {row['email'] if row and 'email' in row.keys() else ''}"))
+        tab3_layout.change_password_btn = QPushButton("Change Password")
+        tab3_layout.addWidget(tab3_layout.change_password_btn)
+        tab3_layout.change_password_btn.setStyleSheet("padding:15px; font-size:20px;margin-bottom:300px; margin-right:150px;margin-left:150px;")
+
+        self.tab.addTab(tab3_content,"My Profile")
 
         # wire client search/checkout and loans buttons
         tab1_layout.search_button.clicked.connect(lambda: self.load_search_results(tab1_layout.search_input.text().strip()))
@@ -1044,10 +1120,29 @@ class ClientWindow(QMainWindow):
         tab1_layout.checkout_btn.clicked.connect(self.checkout_selected)
         tab2_layout.refresh_btn.clicked.connect(self.load_my_loans)
         tab2_layout.return_btn.clicked.connect(self.return_selected)
+        tab3_layout.change_password_btn.clicked.connect(self.change_password)
 
         layout.addWidget(QLabel(f"Welcome Client: {username}"))
         central.setLayout(layout)
-        self.setCentralWidget(central)
+        # wrap client central widget in a scroll area so pages scroll on small windows
+        client_scroll = QScrollArea()
+        client_scroll.setWidgetResizable(True)
+        client_scroll.setWidget(central)
+        self.setCentralWidget(client_scroll)
+
+    def change_password(self) :
+        dlg = ChangePasswordDialog(parent=self)
+        if dlg.exec() == QDialog.Accepted:
+            new_password = dlg.get_new_password()
+        else:
+            return
+        local_cur = connection.cursor()
+        try :
+            local_cur.execute("UPDATE client SET password = ? WHERE client_id = ?",(str(new_password), str(self.client_id)))
+            connection.commit()
+        finally :
+            local_cur.close()
+        QMessageBox.information(self, "Password Changed", "Your password has been updated successfully.")
 
     def checkout_selected(self):
         # ensure loans table
@@ -1133,7 +1228,7 @@ class ClientWindow(QMainWindow):
             self.my_loans_table.setItem(r_i, 1, QTableWidgetItem(str(r['book_pk'])))
             self.my_loans_table.setItem(r_i, 2, QTableWidgetItem(str(r['book_title'])))
             self.my_loans_table.setItem(r_i, 3, QTableWidgetItem(str(r['issued_at'])))
-            self.my_loans_table.setItem(r_i, 4, QTableWidgetItem(str(r.get('due_date') or '')))
+            self.my_loans_table.setItem(r_i, 4, QTableWidgetItem(str(r['due_date'] or '')))
             self.my_loans_table.setItem(r_i, 5, QTableWidgetItem(str(r['returned_at'] or '')))
 
     def return_selected(self):
@@ -1197,7 +1292,44 @@ class ClientWindow(QMainWindow):
                 val = r[col] if col in r.keys() else ''
                 self.search_table.setItem(r_i, c_i, QTableWidgetItem(str(val) if val is not None else ''))
 
+class ChangePasswordDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Change Password")
+        self.resize(300, 150)
+        layout = QVBoxLayout()
 
+        layout.addWidget(QLabel("New Password:"))
+        self.new_password_edit = QLineEdit()
+        self.new_password_edit.setEchoMode(QLineEdit.Password)
+        layout.addWidget(self.new_password_edit)
+
+        layout.addWidget(QLabel("Confirm Password:"))
+        self.confirm_password_edit = QLineEdit()
+        self.confirm_password_edit.setEchoMode(QLineEdit.Password)
+        layout.addWidget(self.confirm_password_edit)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        self.setLayout(layout)
+
+    def accept(self):
+        new_pass = self.new_password_edit.text()
+        confirm_pass = self.confirm_password_edit.text()
+        if not new_pass:
+            QMessageBox.warning(self, "Validation", "New password cannot be empty.")
+            return
+        if new_pass != confirm_pass:
+            QMessageBox.warning(self, "Validation", "Passwords do not match.")
+            return
+        super().accept()
+
+    def get_new_password(self):
+        return self.new_password_edit.text()
+        
 class BookEditDialog(QDialog):
     def __init__(self, parent=None, data=None):
         super().__init__(parent)
