@@ -13,7 +13,7 @@ def ensure_tables(conn):
     cur.execute("CREATE TABLE IF NOT EXISTS client (client_id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT, password TEXT, email TEXT UNIQUE);")
     cur.execute("CREATE TABLE IF NOT EXISTS admin (admin_id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT, password TEXT, email TEXT UNIQUE);")
     cur.execute("CREATE TABLE IF NOT EXISTS book (title TEXT, author TEXT, status TEXT, rack_column_row TEXT, year INTEGER, isbn INTEGER PRIMARY KEY);")
-    cur.execute("CREATE TABLE IF NOT EXISTS loans (loan_id INTEGER PRIMARY KEY AUTOINCREMENT, client_id INTEGER, client_username TEXT, book_pk TEXT, book_title TEXT, issued_at TEXT, due_date TEXT, returned_at TEXT);")
+    cur.execute("CREATE TABLE IF NOT EXISTS loans (loan_id INTEGER PRIMARY KEY AUTOINCREMENT, client_id INTEGER, client_username TEXT, book_pk TEXT, book_title TEXT, issued_at TEXT, due_date TEXT, returned_at TEXT, fine INTEGER);")
     # basic seeds
     cur.execute("INSERT OR IGNORE INTO admin (admin_id, username, password, email) VALUES (?,?,?,?);", (1, 'admin', 'admin', 'admin@gmail.com'))
     cur.execute("INSERT OR IGNORE INTO client (client_id, username, password, email) VALUES (?,?,?,?);", (1, 'a', 'a', 'a@gmail.com'))

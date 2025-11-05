@@ -728,9 +728,10 @@ class AdminWindow(QMainWindow):
         """Populate the admin issue summary table showing number of outstanding loans per client."""
         ensure_loans_table()
         cur = connection.cursor()
-        try:
+        try:                                                   
+            cur.execute("UPDATE loans SET fine = CASE WHEN due_date IS NOT NULL AND returned_at IS NULL AND due_date < ? THEN CAST((JULIANDAY(?) - JULIANDAY(due_date)) AS INTEGER) * 1 ELSE 0 END", (datetime.now().isoformat(), datetime.now().isoformat()))
             cur.execute(
-                "SELECT client_id, client_username, COUNT(*) as issued_count FROM loans WHERE returned_at IS NULL GROUP BY client_id, client_username ORDER BY issued_count DESC"
+                "SELECT client_id, client_username, COUNT(*) as issued_count, fine FROM loans WHERE returned_at IS NULL GROUP BY client_id, client_username ORDER BY issued_count DESC"
             )
             rows = cur.fetchall()
         finally:
@@ -741,7 +742,7 @@ class AdminWindow(QMainWindow):
         overdue_map = {}
         try:
             cur.execute(
-                "SELECT client_id, client_username, COUNT(*) as overdue_count FROM loans WHERE returned_at IS NULL AND due_date IS NOT NULL AND due_date < ? GROUP BY client_id, client_username",
+                "SELECT client_id, client_username, COUNT(*) as overdue_count, fine FROM loans WHERE returned_at IS NULL AND due_date IS NOT NULL AND due_date < ? GROUP BY client_id, client_username",
                 (now_iso,)
             )
             overdue_rows = cur.fetchall()
@@ -751,7 +752,7 @@ class AdminWindow(QMainWindow):
         finally:
             cur.close()
 
-        cols = ['CLIENT', 'ISSUED_COUNT', 'OVERDUE']
+        cols = ['CLIENT', 'ISSUED_COUNT', 'OVERDUE', 'FINE']
         self.issue_table.setColumnCount(len(cols))
         self.issue_table.setHorizontalHeaderLabels(cols)
         self.issue_table.setRowCount(len(rows))
@@ -762,6 +763,7 @@ class AdminWindow(QMainWindow):
             self.issue_table.setItem(r_i, 0, QTableWidgetItem(str(client)))
             self.issue_table.setItem(r_i, 1, QTableWidgetItem(str(count)))
             self.issue_table.setItem(r_i, 2, QTableWidgetItem(str(overdue)))
+            self.issue_table.setItem(r_i, 3, QTableWidgetItem(str(r['fine']) if 'fine' in r.keys() else '0'))
 
     def _on_book_selection_changed(self):
         has = bool(self.book_table.selectedItems())
